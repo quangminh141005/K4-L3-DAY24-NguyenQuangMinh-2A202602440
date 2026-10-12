@@ -38,11 +38,69 @@ rồi gọi verify() phải trả về False.
 from __future__ import annotations
 
 from pathlib import Path
+import fcntl
+import hashlib
+import hmac
+import json
+
+GENESIS = "0" * 64
+REQUIRED = {"ts", "agent_id", "run_id", "tool", "args_hash",
+            "classification", "decision", "reason"}
+
+
+def _digest(entry: dict) -> str:
+    payload = {key: value for key, value in entry.items() if key != "hash"}
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                         separators=(",", ":"), allow_nan=False).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _verify_lines(lines: list[str]) -> bool:
+    previous = GENESIS
+    try:
+        for line in lines:
+            entry = json.loads(line)
+            if not isinstance(entry, dict) or not REQUIRED.issubset(entry):
+                return False
+            reason = entry.get("reason")
+            if not isinstance(reason, str) or not reason.strip():
+                return False
+            if entry.get("decision") not in {"allow", "deny"}:
+                return False
+            if entry.get("prev_hash") != previous:
+                return False
+            saved = entry.get("hash")
+            if not isinstance(saved, str) or not hmac.compare_digest(saved, _digest(entry)):
+                return False
+            previous = saved
+    except (ValueError, TypeError):
+        return False
+    return True
 
 
 def append(entry: dict, path: Path) -> dict:
-    raise NotImplementedError("BƯỚC 3d: implement ledger append")
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        stream.seek(0)
+        lines = stream.read().splitlines()
+        if not _verify_lines(lines):
+            raise ValueError("Refusing to append to an invalid audit chain")
+        record = dict(entry)
+        record["prev_hash"] = json.loads(lines[-1])["hash"] if lines else GENESIS
+        record["hash"] = _digest(record)
+        stream.seek(0, 2)
+        stream.write(json.dumps(record, ensure_ascii=False, sort_keys=True,
+                                allow_nan=False) + "\n")
+        stream.flush()
+        return record
 
 
 def verify(path: Path) -> bool:
-    raise NotImplementedError("BƯỚC 3d: implement ledger verify")
+    try:
+        with Path(path).open(encoding="utf-8") as stream:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_SH)
+            return _verify_lines(stream.read().splitlines())
+    except (OSError, UnicodeError):
+        return False

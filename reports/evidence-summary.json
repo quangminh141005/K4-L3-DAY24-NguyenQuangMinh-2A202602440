@@ -1,0 +1,15 @@
+{
+  "ledger_verify": true,
+  "entries": 264,
+  "reason_completeness": 1.0,
+  "obo_metadata_completeness": 1.0,
+  "decisions": {
+    "('search_docs', 'allow')": 18,
+    "('read_customer', 'deny')": 8,
+    "('http_post', 'deny')": 18,
+    "('read_customer', 'allow')": 220
+  },
+  "last_hash": "18da5db55a235f9589c74884a6a361c9b8f273fc650370088b38b5bcdcb51b0a",
+  "attack_before_bytes": 1490,
+  "attack_after_bytes": 0
+}

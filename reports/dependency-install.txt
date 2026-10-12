@@ -1,0 +1,10 @@
+Command: python -m pip install --require-hashes --force-reinstall -r requirements.lock
+Exit code: 0
+The command downloaded/cached the locked artifacts, uninstalled each existing
+version and reinstalled it with --require-hashes enabled.
+Final command output:
+Successfully installed certifi-2026.7.22 charset-normalizer-3.5.2 idna-3.20 iniconfig-2.3.1 packaging-26.3 pluggy-1.6.0 pygments-2.21.0 pytest-9.1.1 requests-2.34.2 urllib3-2.8.0
+
+Follow-up command: python -m pip check
+Exit code: 0
+No broken requirements found.

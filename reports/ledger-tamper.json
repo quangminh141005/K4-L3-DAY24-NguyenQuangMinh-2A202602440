@@ -1,0 +1,6 @@
+{
+  "original_verify": true,
+  "tampered_line": 27,
+  "tampered_verify": false,
+  "truncated_tail_verify_without_external_anchor": true
+}

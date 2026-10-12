@@ -60,6 +60,14 @@ Interface bắt buộc (agent/loop.py import và gọi hàm này nếu tồn t�
 from __future__ import annotations
 
 from pathlib import Path
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+import hashlib
+import json
+import re
+from uuid import uuid4
+
+from agent import ledger, pii, policy, tools
 
 REPORTS_DIR = Path(__file__).resolve().parent.parent / "reports"
 DEFAULT_LEDGER_PATH = REPORTS_DIR / "ledger.jsonl"
@@ -69,6 +77,115 @@ class RunnerScaffoldPending(NotImplementedError):
     """Only the original 3c stub uses this to enable the CP1/CP2 baseline."""
 
 
+@dataclass(frozen=True)
+class Run:
+    agent_id: str
+    run_id: str
+    principal_id: str
+    scopes: tuple[str, ...]
+    expires_at: str
+    ledger_path: Path
+    parent_scopes: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class TicketSelection:
+    """The entire A -> B payload: filenames become integers, no document text."""
+    ticket_ids: tuple[int, ...]
+
+    def __post_init__(self):
+        if any(type(value) is not int or value <= 0 for value in self.ticket_ids):
+            raise ValueError("Ticket IDs must be positive integers")
+
+
+def _authorize(run: Run, tool: str, args: dict, classification: str,
+               purpose: str, egress: bool = False, event: str = "tool_call") -> bool:
+    """PEP and audit write both complete before any capability executes."""
+    context = policy.PolicyContext(
+        data_classification=classification, request_purpose=purpose,
+        agent_owner=run.agent_id, delegation_depth=1, egress_enabled=egress,
+        principal_id=run.principal_id, requested_tool=tool,
+        agent_scopes=run.scopes, parent_scopes=run.parent_scopes,
+        expires_at=run.expires_at,
+    )
+    allowed, reason = policy.check(context)
+    encoded = json.dumps(args, sort_keys=True, ensure_ascii=False,
+                         separators=(",", ":"), allow_nan=False).encode("utf-8")
+    ledger.append({
+        "ts": datetime.now(timezone.utc).isoformat(), "agent_id": run.agent_id,
+        "run_id": run.run_id, "on_behalf_of": run.principal_id,
+        "expires_at": run.expires_at, "tool": tool,
+        "args_hash": hashlib.sha256(encoded).hexdigest(),
+        "classification": classification, "decision": "allow" if allowed else "deny",
+        "reason": reason, "purpose": purpose, "event": event,
+    }, run.ledger_path)
+    return allowed
+
+
+def _run_a(message: str, llm, run: Run) -> tuple[TicketSelection, str, bool]:
+    if not _authorize(run, "search_docs", {"query": message}, "internal", "summarize-tickets"):
+        return TicketSelection(()), "Yêu cầu không được cấp quyền.", False
+    docs = tools.search_docs(message)
+    # Redact before the summarizer boundary. B receives no text at all.
+    safe_docs = [{"id": d["id"], "text": pii.redact(d["text"])} for d in docs]
+    ticket_ids = set()
+    for doc in safe_docs:
+        match = re.fullmatch(r"ticket-(\d+)[a-z]?\.md", doc["id"])
+        if match and int(match.group(1)) > 0:
+            ticket_ids.add(int(match.group(1)))
+    injected = llm.find_injection("\n\n".join(d["text"] for d in safe_docs))
+    # Only an attempt flag returns to the controller. Attacker customer IDs,
+    # target URLs and instructions never enter the private-data stage.
+    return TicketSelection(tuple(sorted(ticket_ids))), pii.redact(llm.summarize(safe_docs)), injected is not None
+
+
+def _run_b(selection: TicketSelection, run: Run) -> list[dict]:
+    if not selection.ticket_ids:
+        return []
+    # The lab's trusted file includes PII alongside the linkage index. Gate
+    # that file access too: support_l1 must never open the private store.
+    if not _authorize(run, "read_customer", {"ticket_ids": selection.ticket_ids},
+                      "restricted", "support-reply", event="trusted_ticket_index"):
+        return []
+    customers = json.loads(tools.CUSTOMERS_FILE.read_text(encoding="utf-8"))
+    selected = set(selection.ticket_ids)
+    customer_ids = sorted({c["customer_id"] for c in customers
+                           if selected.intersection(c.get("related_tickets", []))})
+    # Retain only the trusted link-derived IDs for subsequent calls.
+    del customers
+    records = []
+    for customer_id in customer_ids:
+        if _authorize(run, "read_customer", {"customer_id": customer_id},
+                      "restricted", "support-reply"):
+            records.append(tools.read_customer(customer_id))
+    return records
+
+
+def _run_c(records: list[dict], run: Run) -> None:
+    # C has no corpus/search capability. Use a code-owned localhost endpoint;
+    # an attacker URL is never part of the A -> B or B -> C contract.
+    url = "http://127.0.0.1:10024/reconcile"
+    body = {"records": records}
+    if _authorize(run, "http_post", {"url": url, "body": body},
+                  "restricted", "support-reply", egress=True):
+        tools.http_post(url, body)
+
+
 def handle(message: str, llm, log_dir: Path | None = None,
            principal_id: str = "support_l1") -> str:
-    raise RunnerScaffoldPending("BƯỚC 3c: implement trifecta split")
+    ledger_path = Path(log_dir) / "ledger.jsonl" if log_dir is not None else DEFAULT_LEDGER_PATH
+    request_id = uuid4().hex
+    expires = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+    parent_scopes = ("search_docs", "read_customer", "http_post")
+
+    def make_run(stage: str, scopes: tuple[str, ...]) -> Run:
+        return Run(agent_id=f"lab24-agent/{request_id}/{stage}",
+                   run_id=f"{request_id}/{stage}", principal_id=principal_id,
+                   scopes=scopes, expires_at=expires, ledger_path=ledger_path,
+                   parent_scopes=parent_scopes)
+
+    selection, summary, attempted_egress = _run_a(message, llm, make_run("a", ("search_docs",)))
+    records = _run_b(selection, make_run("b", ("read_customer",)))
+    if attempted_egress:
+        _run_c(records, make_run("c", ("http_post",)))
+    return summary

@@ -30,10 +30,34 @@ set ở tests/vn_pii_testset.jsonl):
 """
 from __future__ import annotations
 
+import re
+
+# Context resolves ambiguous bank accounts that also look like CCCD/phones.
+_BANK = re.compile(
+    r"(?:\bSTK\b|số\s+tài\s+khoản|so\s+tai\s+khoan|bank_account)"
+    r"[^\d\n]{0,40}(?P<value>(?<!\d)\d{8,16}(?!\d))", re.IGNORECASE
+)
+_PATTERNS = (
+    ("EMAIL", re.compile(r"(?<![\w.+-])[\w.+-]+@[\w-]+(?:\.[\w-]+)+")),
+    ("VN_CCCD", re.compile(r"(?<!\d)\d{12}(?!\d)")),
+    ("VN_PHONE", re.compile(r"(?<!\d)(?:0\d{9,10}|0(?:[ -]?\d){9,10}|\+84(?:[ -]?\d){9,10})(?![ -]?\d)")),
+)
+
 
 def detect(text: str) -> list[dict]:
-    raise NotImplementedError("BƯỚC 3a: implement PII detection")
+    entities = [{"type": "VN_BANK_ACCOUNT", "start": m.start("value"),
+                 "end": m.end("value")} for m in _BANK.finditer(text)]
+    for kind, pattern in _PATTERNS:
+        for match in pattern.finditer(text):
+            start, end = match.span()
+            if any(start < e["end"] and e["start"] < end for e in entities):
+                continue
+            entities.append({"type": kind, "start": start, "end": end})
+    return sorted(entities, key=lambda e: (e["start"], e["end"]))
 
 
 def redact(text: str) -> str:
-    raise NotImplementedError("BƯỚC 3a: implement PII redaction")
+    for entity in reversed(detect(text)):
+        text = (text[:entity["start"]] + f"[REDACTED_{entity['type']}]"
+                + text[entity["end"]:])
+    return text

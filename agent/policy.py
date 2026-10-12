@@ -35,6 +35,11 @@ không phải xác thực người dùng production.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
+import json
+from pathlib import Path
+
+PRINCIPALS_FILE = Path(__file__).resolve().parents[1] / "data" / "principals.json"
 
 
 @dataclass(frozen=True)
@@ -52,4 +57,33 @@ class PolicyContext:
 
 
 def check(context: PolicyContext) -> tuple[bool, str]:
-    raise NotImplementedError("BƯỚC 3b: implement policy check")
+    if context.data_classification not in {"public", "internal", "restricted"}:
+        return False, "deny: unknown data classification"
+    if context.data_classification == "restricted" and context.egress_enabled:
+        return False, "deny: restricted data cannot cross an egress boundary"
+    if not context.agent_owner or context.delegation_depth < 0:
+        return False, "deny: missing agent identity or invalid delegation depth"
+    try:
+        expires = datetime.fromisoformat(context.expires_at.replace("Z", "+00:00"))
+        if expires.tzinfo is None or expires <= datetime.now(timezone.utc):
+            return False, "deny: expired or timezone-less run authorization"
+    except (ValueError, TypeError, AttributeError):
+        return False, "deny: missing or malformed run expiry"
+    try:
+        principal = json.loads(PRINCIPALS_FILE.read_text(encoding="utf-8")).get(context.principal_id)
+    except (OSError, ValueError):
+        return False, "deny: trusted principal registry unavailable"
+    if not isinstance(principal, dict):
+        return False, "deny: unknown simulated principal"
+    if context.request_purpose not in principal.get("purposes", []):
+        return False, "deny: purpose is not authorized for the principal"
+    effective = set(principal.get("allowed_tools", [])) & set(context.agent_scopes)
+    if context.delegation_depth > 0:
+        effective &= set(context.parent_scopes)
+    if context.requested_tool not in {"search_docs", "read_customer", "http_post"}:
+        return False, "deny: missing or unknown tool"
+    if context.requested_tool not in effective:
+        return False, "deny: tool outside principal, agent or delegated parent scopes"
+    if context.requested_tool == "http_post" and not context.egress_enabled:
+        return False, "deny: network capability disabled for this run"
+    return True, "allow: valid principal, purpose, TTL and effective tool scopes"
